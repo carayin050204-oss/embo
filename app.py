@@ -11,14 +11,11 @@ import threading
 import websocket
 from datetime import datetime
 from docx import Document
-
 try:
     from streamlit_mic_recorder import mic_recorder
-
     MIC_AVAILABLE = True
 except:
     MIC_AVAILABLE = False
-
 
 # ── 加载环境变量（兼容Windows各种编码）──────────────────
 def load_env():
@@ -36,13 +33,18 @@ def load_env():
             continue
     return None
 
-
 DEEPSEEK_API_KEY = load_env()
 
-
 def load_xunfei_configs():
-    """加载讯飞配置，支持多账号轮换"""
     configs = []
+    # 先尝试从环境变量读取（云端部署）
+    appid = os.getenv('XUNFEI_APPID', '')
+    apikey = os.getenv('XUNFEI_APIKEY', '')
+    apisecret = os.getenv('XUNFEI_APISECRET', '')
+    if appid and apikey and apisecret:
+        configs.append({'appid': appid, 'apikey': apikey, 'apisecret': apisecret})
+        return configs
+    # 再尝试从.env文件读取（本地）
     for enc in ['utf-8', 'gbk', 'utf-8-sig']:
         try:
             with open('.env', 'r', encoding=enc) as f:
@@ -65,12 +67,9 @@ def load_xunfei_configs():
             continue
     return configs
 
-
 XUNFEI_CONFIGS = load_xunfei_configs()
 
-
 def get_xunfei_auth_url(host, path, apikey, apisecret):
-    """生成讯飞WebSocket鉴权URL"""
     now = datetime.utcnow()
     date = now.strftime('%a, %d %b %Y %H:%M:%S GMT')
     signature_origin = f"host: {host}\ndate: {date}\nGET {path} HTTP/1.1"
@@ -84,15 +83,9 @@ def get_xunfei_auth_url(host, path, apikey, apisecret):
     from urllib.parse import quote
     return f"wss://{host}{path}?authorization={quote(auth)}&date={quote(date)}&host={host}"
 
-
 def xunfei_speech_to_text(audio_bytes):
-    """
-    调用讯飞语音听写API转文字
-    audio_bytes: 音频字节（wav格式）
-    返回: (文字, 错误信息)
-    """
     if not XUNFEI_CONFIGS:
-        return None, "未找到讯飞配置，请在.env文件中添加XUNFEI_APPID/APIKEY/APISECRET"
+        return None, "未找到讯飞配置"
 
     config = XUNFEI_CONFIGS[0]
     appid = config['appid']
@@ -136,52 +129,54 @@ def xunfei_speech_to_text(audio_bytes):
 
     def on_open(ws):
         def send_audio():
-            # 发送开始帧
-            start_frame = {
-                "common": {"app_id": appid},
-                "business": {
-                    "language": "en_us",
-                    "domain": "iat",
-                    "accent": "mandarin",
-                    "vad_eos": 5000
-                },
-                "data": {
-                    "status": 0,
-                    "format": "audio/L16;rate=16000",
-                    "encoding": "raw",
-                    "audio": base64.b64encode(audio_bytes[:1280]).decode()
-                }
-            }
-            ws.send(json.dumps(start_frame))
-            time.sleep(0.04)
-
-            # 发送中间帧（每次1280字节）
-            chunk_size = 1280
-            offset = 1280
-            while offset < len(audio_bytes):
-                chunk = audio_bytes[offset:offset + chunk_size]
-                frame = {
+            time.sleep(0.3)  # 等待连接稳定
+            try:
+                start_frame = {
+                    "common": {"app_id": appid},
+                    "business": {
+                        "language": "en_us",
+                        "domain": "iat",
+                        "accent": "mandarin",
+                        "vad_eos": 5000
+                    },
                     "data": {
-                        "status": 1,
+                        "status": 0,
                         "format": "audio/L16;rate=16000",
                         "encoding": "raw",
-                        "audio": base64.b64encode(chunk).decode()
+                        "audio": base64.b64encode(audio_bytes[:1280]).decode()
                     }
                 }
-                ws.send(json.dumps(frame))
-                offset += chunk_size
+                ws.send(json.dumps(start_frame))
                 time.sleep(0.04)
 
-            # 发送结束帧
-            end_frame = {
-                "data": {
-                    "status": 2,
-                    "format": "audio/L16;rate=16000",
-                    "encoding": "raw",
-                    "audio": ""
+                chunk_size = 1280
+                offset = 1280
+                while offset < len(audio_bytes):
+                    chunk = audio_bytes[offset:offset+chunk_size]
+                    frame = {
+                        "data": {
+                            "status": 1,
+                            "format": "audio/L16;rate=16000",
+                            "encoding": "raw",
+                            "audio": base64.b64encode(chunk).decode()
+                        }
+                    }
+                    ws.send(json.dumps(frame))
+                    offset += chunk_size
+                    time.sleep(0.04)
+
+                end_frame = {
+                    "data": {
+                        "status": 2,
+                        "format": "audio/L16;rate=16000",
+                        "encoding": "raw",
+                        "audio": ""
+                    }
                 }
-            }
-            ws.send(json.dumps(end_frame))
+                ws.send(json.dumps(end_frame))
+            except Exception as e:
+                errors.append(f"发送错误: {e}")
+                done.set()
 
         threading.Thread(target=send_audio).start()
 
@@ -201,7 +196,10 @@ def xunfei_speech_to_text(audio_bytes):
     ws_thread.start()
 
     done.wait(timeout=30)
-    ws.close()
+    try:
+        ws.close()
+    except:
+        pass
 
     if errors:
         return None, errors[0]
@@ -211,11 +209,6 @@ def xunfei_speech_to_text(audio_bytes):
 
 
 def xunfei_pronunciation_score(audio_bytes, reference_text):
-    """
-    调用讯飞语音评测API评英文发音
-    严格按照官方文档：ssb→auw(aus=1)→auw(aus=2)→auw(aus=4)
-    返回: (雅思9分制分数, 错误信息)
-    """
     if not XUNFEI_CONFIGS:
         return None, "未找到讯飞配置"
 
@@ -228,10 +221,7 @@ def xunfei_pronunciation_score(audio_bytes, reference_text):
     path = "/v2/open-ise"
     url = get_xunfei_auth_url(host, path, apikey, apisecret)
 
-    # 英文句子格式：必须加[content]\n前缀
-    # 清理文本：去掉特殊字符
     clean_text = reference_text.strip()
-    # 去掉括号等不支持字符
     for ch in ['(', ')', '[', ']', '{', '}', '@', '#', '$', '%', '&', '*']:
         clean_text = clean_text.replace(ch, '')
     formatted_text = "\uFEFF[content]\n" + clean_text
@@ -256,7 +246,6 @@ def xunfei_pronunciation_score(audio_bytes, reference_text):
                         import xml.etree.ElementTree as ET
                         xml_str = base64.b64decode(raw).decode('utf-8', errors='ignore')
                         root = ET.fromstring(xml_str)
-                        # 英文句子返回read_sentence节点，取total_score
                         for tag in ["read_sentence", "read_chapter", "rec_paper"]:
                             elem = root.find(f".//{tag}")
                             if elem is not None:
@@ -279,8 +268,8 @@ def xunfei_pronunciation_score(audio_bytes, reference_text):
 
     def on_open(ws):
         def send_data():
+            time.sleep(0.3)
             try:
-                # 第1步：ssb - 发送参数，data.status=0，cmd=ssb
                 ssb_frame = {
                     "common": {"app_id": appid},
                     "business": {
@@ -300,7 +289,6 @@ def xunfei_pronunciation_score(audio_bytes, reference_text):
                 ws.send(json.dumps(ssb_frame))
                 time.sleep(0.1)
 
-                # 第2步：auw - 发送音频，aus=1第一帧，aus=2中间帧，aus=4最后帧
                 chunk_size = 1280
                 total_len = len(audio_bytes)
                 offset = 0
@@ -355,29 +343,24 @@ def xunfei_pronunciation_score(audio_bytes, reference_text):
     ws_thread.start()
     done.wait(timeout=30)
     try:
-        ws.close()
+        ise_ws.close()
     except:
         pass
 
     if errors and not result_score[0]:
         return None, errors[0]
     if result_score[0] is not None:
-        # total_score是百分制，转换为雅思9分制
         ielts_score = round_ielts_score(result_score[0] / 100 * 9)
         return ielts_score, None
     return None, "未获取到发音评分"
 
 
 def convert_audio_to_pcm16k(audio_bytes):
-    """将录音转换为讯飞要求的PCM 16K单声道格式
-    支持WebM、OGG、WAV等浏览器录音格式
-    """
     import io
     import subprocess
     import tempfile
-    import os
 
-    # 方法1：用ffmpeg直接转换（最可靠，支持WebM/OGG/WAV等所有格式）
+    # 方法1：用ffmpeg直接转换
     try:
         with tempfile.NamedTemporaryFile(suffix='.webm', delete=False) as tmp_in:
             tmp_in.write(audio_bytes)
@@ -385,14 +368,13 @@ def convert_audio_to_pcm16k(audio_bytes):
 
         tmp_out_path = tmp_in_path.replace('.webm', '.pcm')
 
-        # 查找ffmpeg路径
-        ffmpeg_cmd = None
         ffmpeg_candidates = [
-            r'D:\YoutubeDownloader.win-x64\ffmpeg.exe',
+            '/usr/bin/ffmpeg',
+            '/usr/local/bin/ffmpeg',
             'ffmpeg',
-            r'C:\ffmpeg\bin\ffmpeg.exe',
-            r'D:\ffmpeg\bin\ffmpeg.exe',
+            r'D:\YoutubeDownloader.win-x64\ffmpeg.exe',
         ]
+        ffmpeg_cmd = None
         for p in ffmpeg_candidates:
             try:
                 r = subprocess.run([p, '-version'], capture_output=True, timeout=5)
@@ -401,38 +383,58 @@ def convert_audio_to_pcm16k(audio_bytes):
                     break
             except:
                 continue
-        if not ffmpeg_cmd:
-            raise Exception("ffmpeg not found")
 
-        result = subprocess.run([
-            ffmpeg_cmd, '-y',
-            '-i', tmp_in_path,
-            '-ar', '16000',
-            '-ac', '1',
-            '-f', 's16le',
-            tmp_out_path
-        ], capture_output=True, timeout=15)
+        if ffmpeg_cmd:
+            result = subprocess.run([
+                ffmpeg_cmd, '-y',
+                '-i', tmp_in_path,
+                '-ar', '16000',
+                '-ac', '1',
+                '-f', 's16le',
+                tmp_out_path
+            ], capture_output=True, timeout=15)
 
-        if result.returncode == 0 and os.path.exists(tmp_out_path):
-            with open(tmp_out_path, 'rb') as f:
-                pcm_data = f.read()
+            if result.returncode == 0 and os.path.exists(tmp_out_path):
+                with open(tmp_out_path, 'rb') as f:
+                    pcm_data = f.read()
+                try:
+                    os.unlink(tmp_in_path)
+                    os.unlink(tmp_out_path)
+                except:
+                    pass
+                if len(pcm_data) > 0:
+                    return pcm_data
+        try:
             os.unlink(tmp_in_path)
-            os.unlink(tmp_out_path)
-            return pcm_data
-        os.unlink(tmp_in_path)
+        except:
+            pass
     except Exception:
         pass
 
-    # 方法2：用pydub转换
+    # 方法2：用pydub，明确设置ffmpeg路径
     try:
         from pydub import AudioSegment
+        import pydub.utils as pydub_utils
+
+        for fp in ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']:
+            try:
+                r = subprocess.run([fp, '-version'], capture_output=True, timeout=5)
+                if r.returncode == 0:
+                    pydub_utils.FFMPEG = fp
+                    pydub_utils.FFPROBE = fp.replace('ffmpeg', 'ffprobe')
+                    break
+            except:
+                continue
+
         audio = AudioSegment.from_file(io.BytesIO(audio_bytes))
         audio = audio.set_frame_rate(16000).set_channels(1).set_sample_width(2)
-        return audio.raw_data
+        raw = audio.raw_data
+        if len(raw) > 0:
+            return raw
     except Exception:
         pass
 
-    # 方法3：如果是WAV，用wave模块
+    # 方法3：WAV格式直接用wave模块
     try:
         import wave
         import audioop
@@ -448,7 +450,8 @@ def convert_audio_to_pcm16k(audio_bytes):
             frames = audioop.lin2lin(frames, sampwidth, 2)
         if framerate != 16000:
             frames, _ = audioop.ratecv(frames, 2, 1, framerate, 16000, None)
-        return frames
+        if len(frames) > 0:
+            return frames
     except Exception:
         pass
 
@@ -597,25 +600,21 @@ def parse_part1_questions(doc):
         if not text:
             continue
         is_topic = (
-                not text.startswith("Q:") and not text.startswith("A:") and
-                not text.startswith("参考") and not text.startswith("表达") and
-                not text.startswith("你") and not text.startswith("*") and
-                len(text) < 30 and any(c.isupper() for c in text[:5])
+            not text.startswith("Q:") and not text.startswith("A:") and
+            not text.startswith("参考") and not text.startswith("表达") and
+            not text.startswith("你") and not text.startswith("*") and
+            len(text) < 30 and any(c.isupper() for c in text[:5])
         )
         if is_topic:
             save_qa()
-            current_q = None;
-            current_a = None;
-            current_tips = []
+            current_q = None; current_a = None; current_tips = []
             if current_topic and current_qas:
                 topics.append({"topic": current_topic, "questions": current_qas})
             current_topic = text.strip()
             current_qas = []
         elif text.startswith("Q:") or text.startswith("Q："):
             save_qa()
-            current_q = text[2:].strip();
-            current_a = None;
-            current_tips = []
+            current_q = text[2:].strip(); current_a = None; current_tips = []
         elif text.startswith("A:") or text.startswith("A："):
             current_a = text[2:].strip()
         elif text.startswith("参考思路") or text.startswith("表达亮点"):
@@ -638,45 +637,36 @@ def parse_part23_questions(doc):
         if not text:
             continue
 
-        # 识别Task Card开始
         if "Task Card" in text or "task card" in text.lower():
             if current_item and (current_item.get("cue_card") or current_item.get("topic")):
                 items.append(current_item)
             current_item = {"topic": "", "cue_card": [], "part3": []}
-            in_taskcard = True;
-            in_part3 = False
+            in_taskcard = True; in_part3 = False
             continue
 
         if current_item is None:
             continue
 
-        # 识别Part3开始
         if "Part 3" in text or "延伸问答" in text or "Part3" in text:
-            in_taskcard = False;
-            in_part3 = True
+            in_taskcard = False; in_part3 = True
             continue
 
-        # 跳过参考思路、表达亮点、高分参考答案等辅助内容
         skip_prefixes = ["参考思路", "表达亮点", "A:", "A：", "中文题意", "中文问题", "参考答案", "高分参考"]
         if any(text.startswith(p) for p in skip_prefixes):
             continue
 
         if in_part3:
-            # Part3只提取Q:开头的英文问题
             if text.startswith("Q:") or text.startswith("Q："):
                 q = text[2:].strip()
                 if q:
                     current_item["part3"].append(q)
 
         elif in_taskcard:
-            # 跳过纯中文行
             has_english = any(c.isascii() and c.isalpha() for c in text)
             if not has_english:
                 continue
-            # 第一行英文作为topic
             if not current_item["topic"]:
                 current_item["topic"] = text
-            # You should say、要点bullet等加入cue_card
             elif (text.startswith("You should") or text.startswith("•") or
                   text.startswith("-") or text.startswith("And ")):
                 current_item["cue_card"].append(text)
@@ -687,14 +677,13 @@ def parse_part23_questions(doc):
 
 
 def parse_task1_questions(doc):
-    """解析Task1题库：按分隔线切割，提取题目、图片和范文"""
     import base64
     from docx.oxml.ns import qn
 
     items = []
     current = {"question": "", "essay_type": "", "sample": "", "image_b64": "", "image_idx": -1}
     in_answer = False
-    img_counter = [0]  # 全局图片计数器
+    img_counter = [0]
 
     def save_item():
         if current["question"]:
@@ -707,7 +696,6 @@ def parse_task1_questions(doc):
             })
 
     def get_para_images(para):
-        """提取段落中的图片，返回base64字符串"""
         imgs = []
         for run in para.runs:
             for elem in run._element:
@@ -730,10 +718,8 @@ def parse_task1_questions(doc):
     for para in doc.paragraphs:
         text = para.text.strip()
 
-        # 检查段落是否含图片
         para_imgs = get_para_images(para)
         if para_imgs and not in_answer:
-            # 图表图片，存到当前题目
             current["image_b64"] = para_imgs[0]
             current["image_idx"] = img_counter[0]
             img_counter[0] += 1
@@ -742,7 +728,6 @@ def parse_task1_questions(doc):
         if not text:
             continue
 
-        # 分隔线
         if text.startswith("────") or text.startswith("---"):
             save_item()
             current = {"question": "", "essay_type": "", "sample": "", "image_b64": "", "image_idx": -1}
@@ -780,22 +765,18 @@ def parse_task1_questions(doc):
 
 
 def parse_task2_questions(doc):
-    """解析Task2题库：按分隔线切割，提取题目和范文"""
     items = []
     current = {"question": "", "sample": ""}
     in_answer = False
 
     def save_item():
         if current["question"].strip():
-            # 清理范文中的乱码和特殊格式
             sample = current["sample"].strip()
-            # 过滤乱码行
             clean_lines = []
             for line in sample.split("\n"):
                 line = line.strip()
                 if not line:
                     continue
-                # 过滤包含大量非ASCII字符的行（乱码）
                 ascii_ratio = sum(1 for c in line if c.isascii()) / max(len(line), 1)
                 if ascii_ratio > 0.5 or len(line) < 5:
                     clean_lines.append(line)
@@ -809,41 +790,33 @@ def parse_task2_questions(doc):
         if not text:
             continue
 
-        # 分隔线
         if text.startswith("────") or text.startswith("---") or set(text) <= {"-", "─", " "}:
             save_item()
             current = {"question": "", "sample": ""}
             in_answer = False
             continue
 
-        # 跳过题号标题行（如"1. foreign films"）
         if text[0].isdigit() and "." in text[:4] and "Q:" not in text:
             continue
 
-        # 跳过题型行
         if text.startswith("题型：") or text.startswith("题型:"):
             continue
 
-        # 题目
         if text.startswith("Q:") or text.startswith("Q："):
             current["question"] = text[2:].strip()
             in_answer = False
             continue
 
-        # 范文开始
         if text.startswith("A:") or text.startswith("A："):
             current["sample"] = text[2:].strip()
             in_answer = True
             continue
 
-        # 跳过参考思路和表达亮点
         if text.startswith("参考思路") or text.startswith("表达亮点"):
             in_answer = False
             continue
 
-        # 范文内容
         if in_answer:
-            # 过滤乱码（ASCII占比太低的行）
             ascii_ratio = sum(1 for c in text if c.isascii()) / max(len(text), 1)
             if ascii_ratio > 0.4:
                 if current["sample"]:
@@ -919,22 +892,17 @@ def call_deepseek(system_prompt, user_prompt):
 
 
 def round_ielts_score(score):
-    """严格按照雅思官方规则取整：只能是整数或0.5"""
     try:
         score = float(score)
         score = max(0, min(9, score))
-        # 四舍五入到最近的0.5
         rounded = round(score * 2) / 2
         return rounded
     except:
         return 0.0
 
-
 def calc_ielts_overall(scores):
-    """计算雅思综合分，严格按官方规则"""
     try:
         avg = sum(scores) / len(scores)
-        # 官方规则：.25进到.5，.75进到整数
         frac = avg - int(avg)
         if frac < 0.25:
             overall = float(int(avg))
@@ -945,7 +913,6 @@ def calc_ielts_overall(scores):
         return min(9.0, overall)
     except:
         return 0.0
-
 
 def parse_json_result(text):
     text = text.strip()
@@ -1029,7 +996,7 @@ def page_welcome():
         <div class="welcome-tagline">✦ 你的雅思AI备考伙伴</div>
     </div>
     """, unsafe_allow_html=True)
-    name = st.text_input("", placeholder="请输入你的名字 / Enter your name", label_visibility="collapsed")
+    name = st.text_input("名字", placeholder="请输入你的名字 / Enter your name", label_visibility="collapsed")
     if name:
         st.markdown(f"""
         <div class="greeting-box">
@@ -1072,16 +1039,14 @@ def page_home():
         <div class="feature-desc">粘贴作文，AI按四维度打分并给出建议</div></div></div>
         """, unsafe_allow_html=True)
         if st.button("进入直接评分 →", key="btn_direct"):
-            st.session_state.page = "writing_direct";
-            st.rerun()
+            st.session_state.page = "writing_direct"; st.rerun()
         st.markdown("""
         <div class="feature-card"><div class="feature-icon">📋</div>
         <div><div class="feature-title">出题练习</div>
         <div class="feature-desc">从题库抽题或AI出题，限时或自由作答</div></div></div>
         """, unsafe_allow_html=True)
         if st.button("进入出题练习 →", key="btn_practice"):
-            st.session_state.page = "writing_practice";
-            st.rerun()
+            st.session_state.page = "writing_practice"; st.rerun()
     with tab2:
         st.markdown("""
         <div class="feature-card"><div class="feature-icon">💬</div>
@@ -1089,16 +1054,14 @@ def page_home():
         <div class="feature-desc">选择Part，随机出题，录音作答后AI评分</div></div></div>
         """, unsafe_allow_html=True)
         if st.button("进入口语陪练 →", key="btn_speaking"):
-            st.session_state.page = "speaking_practice";
-            st.rerun()
+            st.session_state.page = "speaking_practice"; st.rerun()
         st.markdown("""
         <div class="feature-card"><div class="feature-icon">🏆</div>
         <div><div class="feature-title">模拟考试</div>
         <div class="feature-desc">按真实流程考试，AI追问，综合打分</div></div></div>
         """, unsafe_allow_html=True)
         if st.button("进入模拟考试 →", key="btn_exam"):
-            st.session_state.page = "speaking_exam";
-            st.rerun()
+            st.session_state.page = "speaking_exam"; st.rerun()
     st.markdown("<br>", unsafe_allow_html=True)
     model = st.selectbox("🤖 文字评分模型", ["DeepSeek（推荐）", "讯飞星火", "Claude（限额）"], key="model_select")
     st.session_state.ai_model = model
@@ -1107,18 +1070,16 @@ def page_home():
 
 # ── 写作直接评分 ──────────────────────────────────────────
 def page_writing_direct():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">✍️ 直接评分</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">✍️ 直接评分</div></div>', unsafe_allow_html=True)
     if st.button("← 返回主页", key="back_direct"):
-        st.session_state.page = "home";
-        st.rerun()
+        st.session_state.page = "home"; st.rerun()
     task_type = st.radio("选择题型", ["Task 1", "Task 2"], horizontal=True)
     question = st.text_area("题目（可选）", height=80,
-                            placeholder="粘贴题目内容，有题目评分更准确；也可以留空...")
+        placeholder="粘贴题目内容，有题目评分更准确；也可以留空...")
     if task_type == "Task 1":
         st.caption("📊 Task 1含图表，可上传图表图片供参考")
         uploaded_img = st.file_uploader("上传图表图片（可选）",
-                                        type=["png", "jpg", "jpeg"], key="chart_img")
+            type=["png", "jpg", "jpeg"], key="chart_img")
         if uploaded_img:
             st.image(uploaded_img, caption="已上传图表", use_container_width=True)
     essay = st.text_area("粘贴或输入你的作文", height=220, placeholder="在此输入雅思作文...")
@@ -1136,23 +1097,19 @@ def page_writing_direct():
             if result:
                 st.session_state.score_result = result
                 st.session_state.current_source = "direct"
-                st.session_state.page = "writing_result";
-                st.rerun()
+                st.session_state.page = "writing_result"; st.rerun()
             else:
                 st.error("评分失败，请稍后重试")
 
 
 # ── 写作出题练习 ──────────────────────────────────────────
 def page_writing_practice():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">📋 出题练习</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">📋 出题练习</div></div>', unsafe_allow_html=True)
     if st.button("← 返回主页", key="back_practice"):
-        st.session_state.page = "home";
-        st.rerun()
+        st.session_state.page = "home"; st.rerun()
     task_type = st.radio("选择题型", ["Task 1", "Task 2"], horizontal=True)
 
     if task_type == "Task 1":
-        # Task1只用题库
         if st.button("🎲 随机出题", key="get_question"):
             bank = st.session_state.question_bank
             questions = bank.get("writing_task1", [])
@@ -1163,12 +1120,10 @@ def page_writing_practice():
                 st.session_state.current_sample = item.get("sample", "")
                 st.session_state.current_image_b64 = item.get("image_b64", "")
                 st.session_state.current_source = "真题库"
-                st.session_state.page = "writing_answer";
-                st.rerun()
+                st.session_state.page = "writing_answer"; st.rerun()
             else:
                 st.warning("Task 1题库暂无内容，请先添加Embo_writing_Task1.docx文件！")
     else:
-        # Task2可以选来源
         source = st.radio("选择题目来源", ["题库", "AI出题"], horizontal=True)
         if st.button("🎲 随机出题", key="get_question"):
             bank = st.session_state.question_bank
@@ -1195,22 +1150,19 @@ def page_writing_practice():
                 st.session_state.current_image_b64 = ""
                 st.session_state.current_source = "AI出题"
             st.session_state.current_essay_type = ""
-            st.session_state.page = "writing_answer";
-            st.rerun()
+            st.session_state.page = "writing_answer"; st.rerun()
 
 
 # ── 写作答题 ──────────────────────────────────────────────
 def page_writing_answer():
     st.markdown('<div class="embo-header"><div class="embo-header-title">✍️ 答题</div></div>', unsafe_allow_html=True)
     if st.button("← 重新选题", key="back_answer"):
-        st.session_state.page = "writing_practice";
-        st.rerun()
+        st.session_state.page = "writing_practice"; st.rerun()
 
     source = st.session_state.current_source
     essay_type = st.session_state.get("current_essay_type", "")
-    task_label = "Task 1" if "task1" in st.session_state.get("current_question", "").lower() or essay_type else "Task 2"
+    task_label = "Task 1" if "task1" in st.session_state.get("current_question","").lower() or essay_type else "Task 2"
 
-    # 显示题目
     type_badge = f'<span class="badge badge-light">{essay_type}</span>' if essay_type else ""
     st.markdown(f"""
     <div class="question-card">
@@ -1221,22 +1173,17 @@ def page_writing_answer():
     </div>
     """, unsafe_allow_html=True)
 
-    # Task1显示图表图片
     image_b64 = st.session_state.get("current_image_b64", "")
     essay_type = st.session_state.get("current_essay_type", "")
     if image_b64 and source == "真题库" and essay_type:
         st.markdown("**📊 题目图表：**")
-        st.markdown(f'<img src="{image_b64}" style="max-width:100%;border-radius:8px;margin-bottom:12px">',
-                    unsafe_allow_html=True)
+        st.markdown(f'<img src="{image_b64}" style="max-width:100%;border-radius:8px;margin-bottom:12px">', unsafe_allow_html=True)
 
-    # 作文输入
     min_words = 150 if (essay_type or source == "真题库") else 250
     target = 150 if min_words == 150 else 250
     essay = st.text_area("在此输入你的作文", height=280, placeholder="开始写作...")
     word_count = len(essay.split()) if essay.strip() else 0
     st.progress(min(word_count / target, 1.0), text=f"已写 {word_count} 词 | 目标 {target} 词")
-
-    # 高分范文在评分结果页显示，此处不显示
 
     if st.button("📊 提交评分 →", key="submit_answer"):
         if not essay.strip() or word_count < 30:
@@ -1245,19 +1192,17 @@ def page_writing_answer():
             task_type_submit = "Task 1" if min_words == 150 else "Task 2"
             with st.spinner("Embo 正在评分中..."):
                 result = score_writing(essay, task_type_submit,
-                                       question=st.session_state.current_question)
+                    question=st.session_state.current_question)
             if result:
                 st.session_state.score_result = result
-                st.session_state.page = "writing_result";
-                st.rerun()
+                st.session_state.page = "writing_result"; st.rerun()
             else:
                 st.error("评分失败，请稍后重试")
 
 
 # ── 写作评分结果 ──────────────────────────────────────────
 def page_writing_result():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">📊 评分结果</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">📊 评分结果</div></div>', unsafe_allow_html=True)
     result = st.session_state.score_result
     if not result:
         st.error("没有评分结果，请返回重试")
@@ -1270,8 +1215,7 @@ def page_writing_result():
         <div class="score-label">综合评分（满分 9.0）</div>
     </div>
     """, unsafe_allow_html=True)
-    for name, key in [("Task Achievement", "task"), ("Coherence & Cohesion", "coherence"),
-                      ("Lexical Resource", "lexical"), ("Grammatical Range", "grammar")]:
+    for name, key in [("Task Achievement","task"),("Coherence & Cohesion","coherence"),("Lexical Resource","lexical"),("Grammatical Range","grammar")]:
         score = result.get(key, 0)
         pct = int(score / 9 * 100)
         st.markdown(f"""
@@ -1283,14 +1227,13 @@ def page_writing_result():
     st.markdown(f"""
     <div class="feedback-good">
         <div class="feedback-title" style="color:#3B6D11">✅ 优点</div>
-        <div class="feedback-text">{result.get('strengths', '')}</div>
+        <div class="feedback-text">{result.get('strengths','')}</div>
     </div>
     <div class="feedback-improve">
         <div class="feedback-title" style="color:#854F0B">💡 改进建议</div>
-        <div class="feedback-text">{result.get('improvements', '')}</div>
+        <div class="feedback-text">{result.get('improvements','')}</div>
     </div>
     """, unsafe_allow_html=True)
-    # 显示高分范文
     sample = st.session_state.get("current_sample", "")
     if sample and st.session_state.current_source in ["真题库", "题库", "模拟题库"]:
         with st.expander("📖 查看高分范文"):
@@ -1310,21 +1253,17 @@ def page_writing_result():
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 再练一篇", key="retry"):
-            st.session_state.page = "writing_practice";
-            st.rerun()
+            st.session_state.page = "writing_practice"; st.rerun()
     with col2:
         if st.button("🏠 返回主页", key="home_result"):
-            st.session_state.page = "home";
-            st.rerun()
+            st.session_state.page = "home"; st.rerun()
 
 
 # ── 口语陪练 ──────────────────────────────────────────────
 def page_speaking_practice():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 口语陪练</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 口语陪练</div></div>', unsafe_allow_html=True)
     if st.button("← 返回主页", key="back_speaking"):
-        st.session_state.page = "home";
-        st.rerun()
+        st.session_state.page = "home"; st.rerun()
     mode = st.radio("选择练习方式", ["随机出题作答", "自由对话陪练"], horizontal=True)
     if mode == "随机出题作答":
         part = st.radio("选择练习 Part", ["Part 1", "Part 2 & 3"], horizontal=True)
@@ -1344,11 +1283,9 @@ def page_speaking_practice():
                         st.session_state.current_tips = qa.get("tips", "")
                         st.session_state.current_topic = topic.get("topic", "")
                     else:
-                        st.warning("题库格式有误！");
-                        return
+                        st.warning("题库格式有误！"); return
                 else:
-                    st.warning("题库暂无内容，请先添加题库文件！");
-                    return
+                    st.warning("题库暂无内容，请先添加题库文件！"); return
             else:
                 key = "speaking_p23_current" if season == "当季真题" else "speaking_p23_past"
                 items = bank.get(key, [])
@@ -1359,27 +1296,20 @@ def page_speaking_practice():
                     st.session_state.current_answer = ""
                     st.session_state.current_tips = ""
                 else:
-                    st.warning("题库暂无内容，请先添加题库文件！");
-                    return
-                st.session_state.page = "speaking_part2";
-                st.rerun()
+                    st.warning("题库暂无内容，请先添加题库文件！"); return
+                st.session_state.page = "speaking_part2"; st.rerun()
                 return
-            st.session_state.page = "speaking_record";
-            st.rerun()
+            st.session_state.page = "speaking_record"; st.rerun()
     else:
-        duration = st.radio("选择练习时长", ["5分钟", "10分钟", "15分钟"], horizontal=True)
-        st.markdown('<div class="question-card">🎙️ 自由对话模式：AI扮演雅思考官，与你进行真实对话练习。</div>',
-                    unsafe_allow_html=True)
+        st.markdown('<div class="question-card">🎙️ 自由对话模式：AI扮演雅思考官，与你进行真实对话练习。</div>', unsafe_allow_html=True)
         if st.button("💬 开始自由对话", key="start_free_chat"):
             st.session_state.free_chat_history = []
-            st.session_state.page = "speaking_free_chat";
-            st.rerun()
+            st.session_state.page = "speaking_free_chat"; st.rerun()
 
 
 # ── 口语录音作答（Part1） ────────────────────────────────
 def page_speaking_record():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 录音作答</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 录音作答</div></div>', unsafe_allow_html=True)
     if st.button("← 重新选题", key="back_record"):
         st.session_state.recognized_text_p1 = ""
         st.session_state.answer_text_p1 = ""
@@ -1387,21 +1317,15 @@ def page_speaking_record():
         st.session_state.last_pcm_p1 = None
         st.session_state.pron_done_p1 = False
         st.session_state.pronunciation_score = None
-        st.session_state.page = "speaking_practice";
-        st.rerun()
+        st.session_state.page = "speaking_practice"; st.rerun()
     topic = st.session_state.get("current_topic", "")
     question = st.session_state.get("current_question", "")
     ref_answer = st.session_state.get("current_answer", "")
     tips = st.session_state.get("current_tips", "")
     if topic:
-        st.markdown(f"<div style='font-size:12px;color:#639922;margin-bottom:6px'>话题：{topic}</div>",
-                    unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:12px;color:#639922;margin-bottom:6px'>话题：{topic}</div>", unsafe_allow_html=True)
     st.markdown(f'<div class="question-card"><b>Q: {question}</b></div>', unsafe_allow_html=True)
 
-    # 录音区域
-    pronunciation_score = st.session_state.get("pronunciation_score", None)
-
-    # 初始化识别结果
     if "recognized_text_p1" not in st.session_state:
         st.session_state.recognized_text_p1 = ""
     if "last_audio_id_p1" not in st.session_state:
@@ -1419,7 +1343,6 @@ def page_speaking_record():
             just_once=True,
             key="recorder_part1"
         )
-        # 只在有新录音且还没识别过时处理
         if audio and audio.get("bytes"):
             audio_id = len(audio["bytes"])
             if st.session_state.get("last_audio_id_p1") != audio_id:
@@ -1435,31 +1358,24 @@ def page_speaking_record():
                 else:
                     st.warning(f"语音识别未成功：{err}，请重新录音或手动输入")
 
-        # 显示识别结果
         if st.session_state.recognized_text_p1:
             st.success("✅ 识别成功！")
-            st.markdown(
-                f'<div class="question-card" style="background:#f0f8e8">📝 识别结果：{st.session_state.recognized_text_p1}</div>',
-                unsafe_allow_html=True)
-            # 发音评测（只在有新录音时）
+            st.markdown(f'<div class="question-card" style="background:#f0f8e8">📝 识别结果：{st.session_state.recognized_text_p1}</div>', unsafe_allow_html=True)
             if st.session_state.get("last_pcm_p1") and not st.session_state.get("pron_done_p1"):
-                # 发音评测暂不支持（需要讯飞专业版）
                 st.session_state.pron_done_p1 = True
 
         st.markdown("**或者手动输入回答：**")
     else:
         st.info("🎙️ 请检查讯飞配置")
 
-    # 用session_state控制文本框内容
     if "answer_text_p1" not in st.session_state:
         st.session_state.answer_text_p1 = ""
-    # 如果有识别结果且文本框为空，填入识别结果
     if st.session_state.recognized_text_p1 and not st.session_state.answer_text_p1:
         st.session_state.answer_text_p1 = st.session_state.recognized_text_p1
     answer = st.text_area("输入你的口语回答（英文）",
-                          height=120,
-                          placeholder="Type your answer in English...",
-                          key="answer_text_p1")
+        height=120,
+        placeholder="Type your answer in English...",
+        key="answer_text_p1")
 
     if ref_answer:
         with st.expander("💡 查看参考答案"):
@@ -1473,40 +1389,6 @@ def page_speaking_record():
         else:
             with st.spinner("Embo 正在评分中..."):
                 system = """你是严格的雅思口语考官，必须严格按照雅思官方band descriptor评分。
-
-【Fluency and Coherence 评分标准】
-9: speaks fluently, only rare repetition/self-correction, content-related; develops topics fully
-8: occasional repetition/self-correction, hesitation is content-related; develops topics coherently
-7: speaks at length without noticeable effort; some repetition/self-correction; uses range of connectives
-6: willing to speak at length but may lose coherence; uses range of discourse markers but not always appropriately
-5: maintains flow but uses repetition/self-correction; may over-use connectives; simple speech fluent but complex causes problems
-4: cannot respond without noticeable pauses; may speak slowly; links basic sentences repetitiously
-3: speaks with long pauses; limited ability to link sentences; only simple responses
-
-【Lexical Resource 评分标准】
-9: full flexibility and precision; idiomatic language naturally and accurately
-8: wide vocabulary flexibly; less common vocabulary skillfully; occasional inaccuracies; paraphrase effectively
-7: vocabulary flexibly for variety of topics; some less common/idiomatic vocabulary; some inappropriate choices; paraphrase effectively
-6: wide enough vocabulary to discuss topics at length; generally paraphrases successfully
-5: manages familiar and unfamiliar topics but with limited flexibility; attempts paraphrase with mixed success
-4: able to talk about familiar topics but only convey basic meaning on unfamiliar; frequent errors in word choice; rarely attempts paraphrase
-3: uses simple vocabulary to convey personal information; insufficient vocabulary for less familiar topics
-
-【Grammatical Range and Accuracy 评分标准】
-9: full range of structures naturally and appropriately; consistently accurate apart from native speaker slips
-8: wide range of structures flexibly; majority of error-free sentences; only very occasional inappropriacies
-7: range of complex structures with some flexibility; frequently produces error-free sentences; some grammatical mistakes persist
-6: mix of simple and complex structures but limited flexibility; frequent mistakes with complex structures causing comprehension problems
-5: basic sentence forms with reasonable accuracy; limited range of complex structures; usually contain errors
-4: basic sentence forms and some correct simple sentences; subordinate structures rare; errors frequent and may lead to misunderstanding
-3: attempts basic sentence forms but limited success; numerous errors except in memorised expressions
-
-【评分规则】
-- 每个维度只能给 0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9 中的一个值
-- 不能出现 6.8, 7.3 等非0.5倍数的分数
-- 发音(Pronunciation)维度暂不评分（需录音）
-- 综合分 overall = 三个维度平均，同样只取0.5倍数
-
 只输出JSON，不要任何其他文字：
 {"fluency":7.0,"lexical":6.5,"grammar":7.0,"strengths":"具体优点","improvements":"改进建议"}"""
                 result_text = call_deepseek(system, f"题目：{question}\n\n考生回答：{answer}")
@@ -1515,7 +1397,6 @@ def page_speaking_record():
                 for k in ["fluency", "lexical", "grammar"]:
                     if k in result:
                         result[k] = round_ielts_score(result[k])
-                # 如果有发音分用真实分，否则用其他三项平均估算
                 pron = st.session_state.get("pronunciation_score", None)
                 if pron:
                     result["pronunciation"] = pron
@@ -1525,25 +1406,21 @@ def page_speaking_record():
                     scores = [result.get(k, 0) for k in ["fluency", "lexical", "grammar"]]
                 result["overall"] = calc_ielts_overall(scores)
                 st.session_state.score_result = result
-                st.session_state.page = "speaking_result";
-                st.rerun()
+                st.session_state.page = "speaking_result"; st.rerun()
             else:
                 st.error("评分失败，请稍后重试")
 
 
 # ── 口语Part2流程 ─────────────────────────────────────────
 def page_speaking_part2():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 Part 2 · 长篇独白</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 Part 2 · 长篇独白</div></div>', unsafe_allow_html=True)
     if st.button("← 返回陪练", key="back_part2"):
-        st.session_state.page = "speaking_practice";
-        st.rerun()
+        st.session_state.page = "speaking_practice"; st.rerun()
 
     item = st.session_state.get("current_p23_item", {})
     cue_card = item.get("cue_card", [])
     topic = item.get("topic", "")
 
-    # 显示Cue Card
     cue_text = "<br>".join(cue_card) if cue_card else ""
     st.markdown(f"""
     <div class="question-card">
@@ -1553,7 +1430,6 @@ def page_speaking_part2():
     </div>
     """, unsafe_allow_html=True)
 
-    # 准备时间提示
     if MIC_AVAILABLE and XUNFEI_CONFIGS:
         p2_audio = mic_recorder(
             start_prompt="🔴 开始录音",
@@ -1577,7 +1453,7 @@ def page_speaking_part2():
         if "p2_answer_input" not in st.session_state or not st.session_state.get("p2_answer_input"):
             st.session_state["p2_answer_input"] = st.session_state["p2_recognized"]
     answer = st.text_area("输入你的Part 2回答（英文）", height=180,
-                          placeholder="Describe the place/person/experience in detail...", key="p2_answer_input")
+        placeholder="Describe the place/person/experience in detail...", key="p2_answer_input")
 
     if st.button("✅ 完成Part 2，进入Part 3 →", key="submit_part2"):
         rec_p2 = st.session_state.get("p2_recognized", "").strip()
@@ -1586,7 +1462,6 @@ def page_speaking_part2():
         if not answer:
             st.warning("请先录音或输入内容！")
         else:
-            # 生成AI过渡语
             with st.spinner("考官正在过渡到Part 3..."):
                 system = "你是雅思口语考官，用英文生成一句自然的过渡语，从Part 2过渡到Part 3，根据考生的回答内容来生成，简短自然。"
                 transition = call_deepseek(system, f"考生Part 2回答：{answer}\n\n请生成过渡语。")
@@ -1595,14 +1470,12 @@ def page_speaking_part2():
             st.session_state.part3_index = 0
             st.session_state.part3_answers = []
             st.session_state.part3_followups = []
-            st.session_state.page = "speaking_part3";
-            st.rerun()
+            st.session_state.page = "speaking_part3"; st.rerun()
 
 
 # ── 口语Part3流程 ─────────────────────────────────────────
 def page_speaking_part3():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 Part 3 · 深度讨论</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">🎤 Part 3 · 深度讨论</div></div>', unsafe_allow_html=True)
 
     item = st.session_state.get("current_p23_item", {})
     part3_qs = item.get("part3", [])
@@ -1610,7 +1483,6 @@ def page_speaking_part3():
     transition = st.session_state.get("part3_transition", "")
     followups = st.session_state.get("part3_followups", [])
 
-    # 显示过渡语（只在第一题显示）
     if idx == 0 and transition:
         st.markdown(f"""
         <div style="background:#EAF3DE;border:1px solid #C0DD97;border-radius:0 12px 12px 12px;
@@ -1620,28 +1492,22 @@ def page_speaking_part3():
         </div>
         """, unsafe_allow_html=True)
 
-    # 进度显示
     total = len(part3_qs)
-    st.markdown(
-        f"<div style='font-size:12px;color:#639922;margin-bottom:8px'>Part 3 进度：{min(idx + 1, total)} / {total}</div>",
-        unsafe_allow_html=True)
+    st.markdown(f"<div style='font-size:12px;color:#639922;margin-bottom:8px'>Part 3 进度：{min(idx+1, total)} / {total}</div>", unsafe_allow_html=True)
 
-    # 显示追问历史
     for i, (q, a, fu) in enumerate(zip(
-            part3_qs[:idx],
-            st.session_state.get("part3_answers", []),
-            followups
+        part3_qs[:idx],
+        st.session_state.get("part3_answers", []),
+        followups
     )):
-        with st.expander(f"✅ 问题{i + 1}：{q[:30]}..."):
+        with st.expander(f"✅ 问题{i+1}：{q[:30]}..."):
             st.write(f"**你的回答：** {a}")
             if fu:
                 st.write(f"**考官追问：** {fu}")
 
-    # 当前问题
     if idx < len(part3_qs):
         current_q = part3_qs[idx]
 
-        # 如果有追问未回答
         if followups and len(followups) > len(st.session_state.get("part3_answers", [])):
             current_q = followups[-1]
             st.markdown(f"""
@@ -1653,7 +1519,7 @@ def page_speaking_part3():
         else:
             st.markdown(f"""
             <div class="question-card">
-                <div style="font-size:11px;color:#639922;margin-bottom:4px">问题 {idx + 1}</div>
+                <div style="font-size:11px;color:#639922;margin-bottom:4px">问题 {idx+1}</div>
                 <b>Q: {current_q}</b>
             </div>
             """, unsafe_allow_html=True)
@@ -1679,13 +1545,12 @@ def page_speaking_part3():
                 st.success(f"✅ {st.session_state[f'p3_txt_{idx}']}")
 
         answer = st.text_area("输入你的回答（英文）", height=100,
-                              value=st.session_state.get(f"p3_txt_{idx}", ""),
-                              placeholder="Give a detailed answer...", key=f"p3_answer_{idx}")
+            value=st.session_state.get(f"p3_txt_{idx}", ""),
+            placeholder="Give a detailed answer...", key=f"p3_answer_{idx}")
 
         col1, col2 = st.columns(2)
         with col1:
             if st.button("📤 提交回答", key=f"submit_p3_{idx}"):
-                # 优先用录音识别结果，其次用文本框
                 recognized = st.session_state.get("current_rec_p3", "").strip()
                 typed = st.session_state.get(f"p3_answer_{idx}", "").strip()
                 final_p3 = recognized or typed or "（已回答）"
@@ -1694,12 +1559,8 @@ def page_speaking_part3():
                 st.session_state.part3_answers = answers
                 st.session_state["current_rec_p3"] = ""
 
-                # AI决定是否追问
                 with st.spinner("考官正在回应..."):
-                    system = """你是雅思口语考官。考生回答后，你需要做两件事：
-1. 如果回答过于简短（少于2句话），追问一个相关问题（英文，一句话）
-2. 如果回答正常，直接回复"NEXT"
-只输出追问内容或"NEXT"，不要其他文字。"""
+                    system = """你是雅思口语考官。回答正常就回复NEXT，否则追问一句英文。只输出追问或NEXT。"""
                     fu = call_deepseek(system, f"题目：{current_q}\n考生回答：{final_p3}")
                 followups_list = st.session_state.get("part3_followups", [])
                 if fu.strip().upper().startswith("NEXT") or len(final_p3.split()) > 20:
@@ -1723,26 +1584,13 @@ def page_speaking_part3():
                 st.rerun()
 
     else:
-        # 所有Part3问题完成，综合评分
         st.success("✅ Part 3 全部完成！")
         if st.button("📊 获取综合评分", key="get_final_score"):
             with st.spinner("Embo 正在综合评分..."):
                 part2_ans = st.session_state.get("part2_answer", "")
                 part3_ans = st.session_state.get("part3_answers", [])
                 all_answers = f"Part 2回答：{part2_ans}\n\nPart 3回答：{chr(10).join(part3_ans)}"
-                system = """你是严格的雅思口语考官，必须严格按照雅思官方band descriptor对Part2和Part3综合表现评分。
-
-【Fluency and Coherence】
-9:speaks fluently, rare repetition; 8:occasional repetition, develops topics coherently; 7:speaks at length without effort, range of connectives; 6:willing to speak at length but may lose coherence; 5:maintains flow but uses repetition, simple speech fluent; 4:noticeable pauses, speaks slowly; 3:long pauses, limited linking
-
-【Lexical Resource】
-9:full flexibility and precision, idiomatic; 8:wide vocabulary flexibly, paraphrase effectively; 7:vocabulary for variety of topics, some inappropriate choices; 6:wide enough vocabulary, generally paraphrases; 5:limited flexibility, mixed paraphrase; 4:familiar topics only, frequent word choice errors; 3:simple vocabulary, insufficient for unfamiliar topics
-
-【Grammatical Range and Accuracy】
-9:full range naturally, consistently accurate; 8:wide range flexibly, majority error-free; 7:range of complex structures, frequently error-free; 6:mix simple/complex but limited flexibility, frequent mistakes; 5:basic forms reasonable accuracy, limited complex; 4:basic forms, subordinate rare, frequent errors; 3:attempts basic forms, numerous errors
-
-【评分规则】只能给0.5倍数的分数，不能出现6.8、7.3等。
-只输出JSON：{"fluency":7.0,"lexical":6.5,"grammar":7.0,"strengths":"具体优点","improvements":"改进建议"}"""
+                system = """你是严格的雅思口语考官，只输出JSON：{"fluency":7.0,"lexical":6.5,"grammar":7.0,"strengths":"具体优点","improvements":"改进建议"}"""
                 result_text = call_deepseek(system, all_answers)
                 result = parse_json_result(result_text)
             if result:
@@ -1754,20 +1602,17 @@ def page_speaking_part3():
                     result["overall"] = calc_ielts_overall(scores)
                 result["pronunciation"] = "需录音功能支持"
                 st.session_state.score_result = result
-                st.session_state.page = "speaking_result";
-                st.rerun()
+                st.session_state.page = "speaking_result"; st.rerun()
             else:
                 st.error("评分失败，请稍后重试")
 
 
 # ── 口语评分结果 ──────────────────────────────────────────
 def page_speaking_result():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">📊 口语评分结果</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">📊 口语评分结果</div></div>', unsafe_allow_html=True)
     result = st.session_state.score_result
     if not result:
-        st.error("没有评分结果");
-        return
+        st.error("没有评分结果"); return
     overall = result.get("overall", 0)
     st.markdown(f"""
     <div class="score-big">
@@ -1775,8 +1620,7 @@ def page_speaking_result():
         <div class="score-label">口语综合评分（满分 9.0）</div>
     </div>
     """, unsafe_allow_html=True)
-    for name, key, color in [("Fluency & Coherence", "fluency", "#639922"), ("Lexical Resource", "lexical", "#639922"),
-                             ("Grammatical Range", "grammar", "#639922")]:
+    for name, key, color in [("Fluency & Coherence","fluency","#639922"),("Lexical Resource","lexical","#639922"),("Grammatical Range","grammar","#639922")]:
         score = result.get(key, 0)
         pct = int(score / 9 * 100)
         st.markdown(f"""
@@ -1805,31 +1649,27 @@ def page_speaking_result():
     st.markdown(f"""
     <div class="feedback-good">
         <div class="feedback-title" style="color:#3B6D11">✅ 优点</div>
-        <div class="feedback-text">{result.get('strengths', '')}</div>
+        <div class="feedback-text">{result.get('strengths','')}</div>
     </div>
     <div class="feedback-improve">
         <div class="feedback-title" style="color:#854F0B">💡 改进建议</div>
-        <div class="feedback-text">{result.get('improvements', '')}</div>
+        <div class="feedback-text">{result.get('improvements','')}</div>
     </div>
     """, unsafe_allow_html=True)
     col1, col2 = st.columns(2)
     with col1:
         if st.button("🔄 再练一题", key="retry_speaking"):
-            st.session_state.page = "speaking_practice";
-            st.rerun()
+            st.session_state.page = "speaking_practice"; st.rerun()
     with col2:
         if st.button("🏠 返回主页", key="home_speaking"):
-            st.session_state.page = "home";
-            st.rerun()
+            st.session_state.page = "home"; st.rerun()
 
 
 # ── 模拟考试 ──────────────────────────────────────────────
 def page_speaking_exam():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">🏆 模拟考试</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">🏆 模拟考试</div></div>', unsafe_allow_html=True)
     if st.button("← 返回主页", key="back_exam"):
-        st.session_state.page = "home";
-        st.rerun()
+        st.session_state.page = "home"; st.rerun()
 
     exam_phase = st.session_state.get("exam_phase", "setup")
 
@@ -1847,7 +1687,6 @@ def page_speaking_exam():
         """, unsafe_allow_html=True)
         if st.button("🚀 开始模拟考试", key="start_exam"):
             bank = st.session_state.question_bank
-            # 准备Part1题目
             topics = bank.get("speaking_p1_current", []) or bank.get("speaking_p1_past", [])
             part1_questions = []
             if topics:
@@ -1857,12 +1696,11 @@ def page_speaking_exam():
                     if qs:
                         q = random.choice(qs)
                         part1_questions.append({
-                            "topic": t.get("topic", ""),
-                            "question": q.get("question", ""),
-                            "answer": q.get("answer", ""),
-                            "tips": q.get("tips", "")
+                            "topic": t.get("topic",""),
+                            "question": q.get("question",""),
+                            "answer": q.get("answer",""),
+                            "tips": q.get("tips","")
                         })
-            # 准备Part2&3题目
             items = bank.get("speaking_p23_current", []) or bank.get("speaking_p23_past", [])
             p23_item = random.choice(items) if items else {}
 
@@ -1879,9 +1717,7 @@ def page_speaking_exam():
         idx = st.session_state.get("exam_part1_index", 0)
         total = len(questions)
 
-        st.markdown(
-            f"<div style='font-size:12px;color:#639922;margin-bottom:8px'>📌 Part 1 · 问题 {idx + 1} / {total}</div>",
-            unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:12px;color:#639922;margin-bottom:8px'>📌 Part 1 · 问题 {idx+1} / {total}</div>", unsafe_allow_html=True)
         st.progress((idx) / max(total, 1), text=f"Part 1 进行中")
         st.warning("⏱️ 每题限时约1分钟，请简短回答")
 
@@ -1889,11 +1725,10 @@ def page_speaking_exam():
             q_data = questions[idx]
             st.markdown(f"""
             <div class="question-card">
-                <div style="font-size:11px;color:#639922;margin-bottom:4px">话题：{q_data.get('topic', '')}</div>
-                <b>Q: {q_data.get('question', '')}</b>
+                <div style="font-size:11px;color:#639922;margin-bottom:4px">话题：{q_data.get('topic','')}</div>
+                <b>Q: {q_data.get('question','')}</b>
             </div>
             """, unsafe_allow_html=True)
-            # 录音功能
             if MIC_AVAILABLE and XUNFEI_CONFIGS:
                 exam1_audio = mic_recorder(
                     start_prompt="🔴 开始录音",
@@ -1915,8 +1750,7 @@ def page_speaking_exam():
                 if st.session_state.get("current_rec_ep1_idx") == idx and st.session_state.get("current_rec_ep1"):
                     st.success(f"✅ {st.session_state['current_rec_ep1']}")
             answer = st.text_area("输入你的回答（英文）", height=80,
-                                  placeholder="Answer briefly and naturally...", key=f"exam_p1_{idx}")
-            # 模拟考试不显示参考答案
+                placeholder="Answer briefly and naturally...", key=f"exam_p1_{idx}")
             if st.button("下一题 →", key=f"exam_next_{idx}"):
                 recognized1 = st.session_state.get("current_rec_ep1", "").strip()
                 typed1 = st.session_state.get(f"exam_p1_{idx}", "").strip()
@@ -1942,7 +1776,6 @@ def page_speaking_exam():
         item = st.session_state.get("current_p23_item", {})
         cue_card = item.get("cue_card", [])
         topic = item.get("topic", "")
-        cue_card = item.get("cue_card", [])
         cue_text = "<br>".join(cue_card) if cue_card else ""
         st.markdown(f"""
         <div class="question-card">
@@ -1973,7 +1806,7 @@ def page_speaking_exam():
             if st.session_state.get("ep2_txt"):
                 st.success(f"✅ {st.session_state['ep2_txt']}")
         answer = st.text_area("输入你的Part 2回答（英文）", height=160,
-                              placeholder="Describe in detail...", key="exam_part2_answer")
+            placeholder="Describe in detail...", key="exam_part2_answer")
         if st.button("✅ 完成Part 2，进入Part 3 →", key="exam_submit_part2"):
             recognized2 = st.session_state.get("ep2_txt", "").strip()
             typed2 = st.session_state.get("exam_part2_answer", "").strip()
@@ -2009,21 +1842,15 @@ def page_speaking_exam():
             """, unsafe_allow_html=True)
 
         total = len(part3_qs)
-        st.markdown(
-            f"<div style='font-size:12px;color:#639922;margin-bottom:8px'>📌 Part 3 · 问题 {min(idx + 1, total)} / {total}</div>",
-            unsafe_allow_html=True)
+        st.markdown(f"<div style='font-size:12px;color:#639922;margin-bottom:8px'>📌 Part 3 · 问题 {min(idx+1,total)} / {total}</div>", unsafe_allow_html=True)
 
         if idx < total:
             current_q = part3_qs[idx]
-            if followups and len(followups) > len(st.session_state.get("part3_answers", [])):
+            if followups and len(followups) > len(st.session_state.get("part3_answers",[])):
                 current_q = followups[-1]
-                st.markdown(
-                    f'<div class="question-card"><div style="font-size:11px;color:#639922;margin-bottom:4px">🔄 追问</div><b>{current_q}</b></div>',
-                    unsafe_allow_html=True)
+                st.markdown(f'<div class="question-card"><div style="font-size:11px;color:#639922;margin-bottom:4px">🔄 追问</div><b>{current_q}</b></div>', unsafe_allow_html=True)
             else:
-                st.markdown(
-                    f'<div class="question-card"><div style="font-size:11px;color:#639922;margin-bottom:4px">问题 {idx + 1}</div><b>Q: {current_q}</b></div>',
-                    unsafe_allow_html=True)
+                st.markdown(f'<div class="question-card"><div style="font-size:11px;color:#639922;margin-bottom:4px">问题 {idx+1}</div><b>Q: {current_q}</b></div>', unsafe_allow_html=True)
 
                 if MIC_AVAILABLE and XUNFEI_CONFIGS:
                     exam3_audio = mic_recorder(
@@ -2045,8 +1872,8 @@ def page_speaking_exam():
                     if st.session_state.get(f"exam_p3_text_{idx}"):
                         st.success(f"✅ {st.session_state[f'exam_p3_text_{idx}']}")
             answer = st.text_area("输入你的回答（英文）", height=80,
-                                  value=st.session_state.get(f"ep3_txt_{idx}", ""),
-                                  placeholder="Give a detailed answer...", key=f"exam_p3_{idx}")
+                    value=st.session_state.get(f"ep3_txt_{idx}", ""),
+                    placeholder="Give a detailed answer...", key=f"exam_p3_{idx}")
             col1, col2 = st.columns(2)
             with col1:
                 if st.button("📤 提交回答", key=f"exam_submit_p3_{idx}"):
@@ -2059,7 +1886,7 @@ def page_speaking_exam():
                     st.session_state.part3_answers = answers
                     with st.spinner("考官正在回应..."):
                         fu = call_deepseek("你是雅思口语考官。回答正常就回复NEXT，否则追问一句英文。只输出追问或NEXT。",
-                                           f"题目：{current_q}\n回答：{final3}")
+                            f"题目：{current_q}\n回答：{final3}")
                     followups_list = st.session_state.get("part3_followups", [])
                     if fu.strip().upper().startswith("NEXT") or len(final3.split()) > 15:
                         followups_list.append("")
@@ -2087,19 +1914,7 @@ def page_speaking_exam():
                     p2_ans = st.session_state.get("part2_answer", "")
                     p3_ans = st.session_state.get("part3_answers", [])
                     all_text = f"Part1回答：{chr(10).join(p1_ans)}\n\nPart2回答：{p2_ans}\n\nPart3回答：{chr(10).join(p3_ans)}"
-                    system = """你是严格的雅思口语考官，必须严格按照雅思官方band descriptor对完整模拟考试（Part1+Part2+Part3）综合表现评分。
-
-【Fluency and Coherence】
-9:speaks fluently, rare repetition; 8:occasional repetition, develops topics coherently; 7:speaks at length without effort; 6:willing to speak at length but may lose coherence; 5:maintains flow but uses repetition; 4:noticeable pauses; 3:long pauses
-
-【Lexical Resource】
-9:full flexibility, idiomatic; 8:wide vocabulary, paraphrase effectively; 7:vocabulary for variety of topics; 6:wide enough, generally paraphrases; 5:limited flexibility; 4:familiar topics only; 3:simple vocabulary
-
-【Grammatical Range and Accuracy】
-9:full range, consistently accurate; 8:wide range, majority error-free; 7:complex structures, frequently error-free; 6:mix simple/complex, frequent mistakes; 5:basic forms, reasonable accuracy; 4:basic forms, frequent errors; 3:attempts basic, numerous errors
-
-【评分规则】每个维度只能给0.5倍数分数（如6.0, 6.5, 7.0），不能出现6.8、7.3等非法分数。
-只输出JSON：{"fluency":7.0,"lexical":6.5,"grammar":7.0,"strengths":"具体优点","improvements":"改进建议"}"""
+                    system = """你是严格的雅思口语考官，只输出JSON：{"fluency":7.0,"lexical":6.5,"grammar":7.0,"strengths":"具体优点","improvements":"改进建议"}"""
                     result_text = call_deepseek(system, all_text)
                     result = parse_json_result(result_text)
                 if result:
@@ -2112,19 +1927,16 @@ def page_speaking_exam():
                     result["pronunciation"] = "需录音功能支持"
                     st.session_state.score_result = result
                     st.session_state.exam_phase = "setup"
-                    st.session_state.page = "speaking_result";
-                    st.rerun()
+                    st.session_state.page = "speaking_result"; st.rerun()
                 else:
                     st.error("评分失败，请稍后重试")
 
 
 # ── 自由对话陪练 ──────────────────────────────────────────
 def page_speaking_free_chat():
-    st.markdown('<div class="embo-header"><div class="embo-header-title">💬 自由对话陪练</div></div>',
-                unsafe_allow_html=True)
+    st.markdown('<div class="embo-header"><div class="embo-header-title">💬 自由对话陪练</div></div>', unsafe_allow_html=True)
     if st.button("← 返回陪练", key="back_free_chat"):
-        st.session_state.page = "speaking_practice";
-        st.rerun()
+        st.session_state.page = "speaking_practice"; st.rerun()
     if not st.session_state.free_chat_history:
         with st.spinner("Embo 考官正在准备..."):
             system = """你是专业的雅思口语考官，用英文与考生进行口语练习。
@@ -2146,26 +1958,21 @@ def page_speaking_free_chat():
                 <div style="font-size:14px;color:#333;line-height:1.6">{msg["content"]}</div>
             </div>
             """, unsafe_allow_html=True)
-    user_input = st.text_area("输入你的回答（英文）", height=100, placeholder="Type your answer in English...",
-                              key="free_chat_input")
+    user_input = st.text_area("输入你的回答（英文）", height=100, placeholder="Type your answer in English...", key="free_chat_input")
     col1, col2 = st.columns(2)
     with col1:
         if st.button("📤 发送回答", key="send_answer"):
             if user_input.strip():
                 st.session_state.free_chat_history.append({"role": "user", "content": user_input})
                 with st.spinner("考官正在回应..."):
-                    history_text = "\n".join([f"{'考官' if m['role'] == 'examiner' else '考生'}：{m['content']}" for m in
-                                              st.session_state.free_chat_history])
-                    next_q = call_deepseek("你是雅思口语考官，根据对话继续提一个问题，英文回复。",
-                                           f"对话历史：\n{history_text}\n请继续。")
+                    history_text = "\n".join([f"{'考官' if m['role']=='examiner' else '考生'}：{m['content']}" for m in st.session_state.free_chat_history])
+                    next_q = call_deepseek("你是雅思口语考官，根据对话继续提一个问题，英文回复。", f"对话历史：\n{history_text}\n请继续。")
                 st.session_state.free_chat_history.append({"role": "examiner", "content": next_q})
                 st.rerun()
     with col2:
         if st.button("🏁 结束对话", key="end_chat"):
             st.session_state.free_chat_history = []
-            st.session_state.page = "speaking_practice";
-            st.rerun()
-
+            st.session_state.page = "speaking_practice"; st.rerun()
 
 # ── 路由 ──────────────────────────────────────────────────
 pages = {
